@@ -18,6 +18,18 @@ param(
 $py = Join-Path $Root "venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { throw "venv python not found: $py" }
 
+# The shared tuning file (pipeline.yaml) lives with JoyGen, in WSL. Without
+# this variable pipeline_config.py falls back to built-in defaults, which have
+# no joygen_output section at all -- the avatar clip directory ends up empty
+# and every generated video 404s, with only one easily-missed warning line.
+# Left alone when already set, and skipped when the path is gone (e.g. once
+# both services are co-located on one Linux box, where the repo-relative
+# candidate in pipeline_config.py is the one that hits).
+if (-not $env:IMOOD_PIPELINE_CONFIG) {
+  $shared = "\\wsl.localhost\Ubuntu-22.04\home\cgmhaha\imood_project\joygen-deployment-notes\configs\pipeline.yaml"
+  if (Test-Path $shared) { $env:IMOOD_PIPELINE_CONFIG = $shared }
+}
+
 # This runs hidden, so the log is the only way to see anything. Kept out of
 # the repo on purpose.
 $logDir = Join-Path $env:LOCALAPPDATA "imood-voice"
