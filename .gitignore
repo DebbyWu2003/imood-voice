@@ -17,3 +17,7 @@ samples/
 
 # 匯出的報告 PDF（原始檔是 Artifact，不進版控）
 *.pdf
+
+# 本機跑 uvicorn 時的輸出，不進版控
+server_out.log
+server_e*.log
