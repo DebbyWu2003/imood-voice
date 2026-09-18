@@ -92,8 +92,22 @@ PROMPT_WAV = os.environ.get(
 PROMPT_TEXT = os.environ.get("TTS_PROMPT_TEXT", "希望你以后能够做的比我还好呦。")
 ZERO_SHOT_SPK_ID = "imood_default"
 
+# --- 男聲 -------------------------------------------------------------------
+# 前端讓使用者選一男一女，所以 startup 時註冊兩個 zero-shot 語者。
+# 男聲要一段 ~5-10 秒乾淨人聲 + 對應逐字稿（逐字稿要跟音檔內容一致，不然抽出來
+# 的特徵會偏）。沒設定就只註冊女聲，收到 voice="male" 時退回女聲並印一行警告，
+# 不讓服務因為缺素材而起不來。
+PROMPT_WAV_MALE = os.environ.get("TTS_PROMPT_WAV_MALE", "")
+PROMPT_TEXT_MALE = os.environ.get("TTS_PROMPT_TEXT_MALE", "")
+ZERO_SHOT_SPK_ID_MALE = "imood_male"
+
+# voice -> zero_shot_spk_id，startup 時依實際註冊成功的填
+VOICE_SPK_IDS = {}
+
 # --- CosyVoice-300M-SFT 語者 -----------------------------------------------
+# 舊後端有內建語者，直接對應，不需要參考音檔
 SPEAKER = os.environ.get("TTS_SFT_SPEAKER", "中文女")
+SFT_SPEAKERS = {"female": "中文女", "male": "中文男"}
 
 # --- 加速開關 --------------------------------------------------------------
 # CosyVoice2：照 repo 的 vllm_example，vllm + trt + fp16 全開；jit 預設關
@@ -175,8 +189,20 @@ def load_model():
     if _IS_V2:
         # 註冊 zero-shot 參考語者：抽一次 prompt 特徵存進 spk2info，之後每個
         # 請求用 zero_shot_spk_id 引用，不重抽（省首塊延遲）。
-        print(f"[tts] registering zero-shot speaker from {PROMPT_WAV}", flush=True)
+        print(f"[tts] registering zero-shot speaker (female) from {PROMPT_WAV}",
+              flush=True)
         cosyvoice.add_zero_shot_spk(PROMPT_TEXT, PROMPT_WAV, ZERO_SHOT_SPK_ID)
+        VOICE_SPK_IDS["female"] = ZERO_SHOT_SPK_ID
+
+        if PROMPT_WAV_MALE and os.path.isfile(PROMPT_WAV_MALE) and PROMPT_TEXT_MALE:
+            print(f"[tts] registering zero-shot speaker (male) from "
+                  f"{PROMPT_WAV_MALE}", flush=True)
+            cosyvoice.add_zero_shot_spk(PROMPT_TEXT_MALE, PROMPT_WAV_MALE,
+                                        ZERO_SHOT_SPK_ID_MALE)
+            VOICE_SPK_IDS["male"] = ZERO_SHOT_SPK_ID_MALE
+        else:
+            print("[tts] WARNING: 沒有男聲參考音檔（TTS_PROMPT_WAV_MALE / "
+                  "TTS_PROMPT_TEXT_MALE），voice=male 會退回女聲", flush=True)
 
     # imood 的 LLM 一律回覆繁體中文，但 CosyVoice 的文字前處理偏簡體，餵繁體
     # 進去時字典沒有的字會念出不像中文的音。這裡只轉「要合成的文字」，前端
@@ -201,6 +227,7 @@ def load_model():
 
 class SynthesizeRequest(BaseModel):
     text: str
+    voice: str = "female"     # female | male；認不得的值一律退回 female
 
 
 def _level(x: "np.ndarray") -> "np.ndarray":
@@ -237,17 +264,19 @@ def _pcm16_bytes(speech_tensor, resampler) -> bytes:
     return (np.clip(x, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
-def _model_chunks(text: str):
+def _model_chunks(text: str, voice: str = "female"):
     """依後端選 inference 方式，逐段 yield CosyVoice 原生輸出（dict）。"""
     if _IS_V2:
+        spk_id = VOICE_SPK_IDS.get(voice) or VOICE_SPK_IDS.get("female")             or ZERO_SHOT_SPK_ID
         yield from cosyvoice.inference_zero_shot(
-            text, "", "", zero_shot_spk_id=ZERO_SHOT_SPK_ID, stream=True
+            text, "", "", zero_shot_spk_id=spk_id, stream=True
         )
     else:
-        yield from cosyvoice.inference_sft(text, SPEAKER, stream=True)
+        yield from cosyvoice.inference_sft(
+            text, SFT_SPEAKERS.get(voice, SPEAKER), stream=True)
 
 
-def _synthesize_chunks(text: str) -> Iterator[bytes]:
+def _synthesize_chunks(text: str, voice: str = "female") -> Iterator[bytes]:
     """
     逐段呼叫 CosyVoice stream=True，把每段輸出 resample 成 16kHz，再切成固定
     320ms 的 PCM16 區塊依序 yield。CosyVoice 原生一段 ~1.7-2 秒，比 JoyGen 要
@@ -261,7 +290,7 @@ def _synthesize_chunks(text: str) -> Iterator[bytes]:
 
     text = _t2s.convert(text)
     carry = b""  # 上一個 model chunk 切剩、不足 320ms 的尾巴
-    for out in _model_chunks(text):
+    for out in _model_chunks(text, voice):
         pcm = carry + _pcm16_bytes(out["tts_speech"], resampler)
         n_full = len(pcm) // CHUNK_BYTES
         for i in range(n_full):
@@ -277,8 +306,11 @@ def synthesize(req: SynthesizeRequest):
     text = req.text.strip()
     if not text or cosyvoice is None:
         return StreamingResponse(iter(()), media_type="application/octet-stream")
+    voice = (req.voice or "female").lower()
+    if voice not in ("female", "male"):
+        voice = "female"
     return StreamingResponse(
-        _synthesize_chunks(text), media_type="application/octet-stream"
+        _synthesize_chunks(text, voice), media_type="application/octet-stream"
     )
 
 
@@ -289,4 +321,6 @@ def health():
         "model_loaded": cosyvoice is not None,
         "model_dir": MODEL_DIR,
         "backend": "cosyvoice2-zeroshot" if _IS_V2 else "cosyvoice-300m-sft",
+        # 部署時用這個確認男聲素材到底有沒有掛上
+        "voices": sorted(VOICE_SPK_IDS) if _IS_V2 else sorted(SFT_SPEAKERS),
     }
