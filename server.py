@@ -24,12 +24,14 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import asyncio
 import json
 import os
 import time
+from pathlib import Path
 
 import base64
 
@@ -37,9 +39,11 @@ import base64
 # （見 voice_asr._register_nvidia_dll_dirs）。llama-cpp-python 的 CUDA build 同樣
 # 要靠這些 DLL（cudart64_12 / cublas64_12），Windows 上又不會自己找 pip 裝的版本，
 # 所以一定要在 import llama_cpp 之前先 import voice_asr。
-from voice_asr import Endpointer, Transcriber
+from voice_asr import EndpointConfig, Endpointer, Transcriber
 from llama_cpp import Llama
 from tts_client import stream_tts
+import pipeline_config
+from joygen_client import JoyGenClient
 
 MODEL_PATH = "./models/qwen2.5-1.5b-instruct-q4_k_m.gguf"
 N_CTX = 2048
@@ -57,8 +61,33 @@ ASR_MODEL_SIZE = "small"  # 選型見 docs/asr-41-results.md
 # transcript 之後暫緩丟 LLM，再等這麼久的靜音看使用者有沒有續句（念頭中間
 # 停頓 > Endpointer 的 end_silence_ms 會被切成兩段，這裡把兩段 transcript
 # 併起來一起丟 LLM）。0 = 關閉（辨識完立刻回覆）。見 docs/asr-42-vad-plan.md。
-VOICE_COALESCE_MS = 1000
+PIPELINE_CFG = pipeline_config.load()
+ENDPOINT_KWARGS = pipeline_config.endpoint_kwargs(PIPELINE_CFG)
+
+VOICE_COALESCE_MS = PIPELINE_CFG["vad"].get("coalesce_ms", 1000)
 VOICE_COALESCE_MAX_SEGMENTS = 6  # 安全上限：最多併這麼多段就強制送出
+
+# JoyGen input streaming：TTS 的每一塊 PCM 同時送給 JoyGen 生成嘴型畫面。
+# 連不上就只是沒有畫面，語音與文字流程不受影響（見 joygen_client.py）。
+_JOYGEN_CFG = PIPELINE_CFG["joygen_input"]
+JOYGEN_ENABLED = bool(_JOYGEN_CFG.get("enabled", True))
+JOYGEN_HOST = _JOYGEN_CFG.get("ingest_host", "127.0.0.1")
+JOYGEN_PORT = int(_JOYGEN_CFG.get("ingest_port", 8100))
+# JoyGen 送出 END 之後要把整句畫完才回報，所以這個逾時要蓋過「一句話的生成
+# 時間」而不是網路往返。pose-driven 在慢的 GPU 上一句可能要好幾十秒。
+JOYGEN_STATUS_TIMEOUT = float(_JOYGEN_CFG.get("ingest_status_timeout_s", 300))
+
+# JoyGen 每句話輸出一支 mp4（joygen_output.mode = utterance_file），瀏覽器
+# 播不了 RTP，所以由這裡把那個目錄靜態送出去。utterance_dir 是 JoyGen 那端
+# 看到的路徑（相對於 notes 根目錄），clip_dir() 換算成這台機器走得到的路徑。
+JOYGEN_CLIP_DIR = pipeline_config.clip_dir(PIPELINE_CFG)
+JOYGEN_CLIP_ROUTE = "/avatar-clips"
+# 0.0.0.0 是監聽位址，不能拿來連線
+if JOYGEN_HOST in ("0.0.0.0", "::"):
+    JOYGEN_HOST = "127.0.0.1"
+
+DEFAULT_VOICE = PIPELINE_CFG["tts"].get("voice", "female")
+VALID_VOICES = ("female", "male")
 
 # 回覆語音（TTS）——獨立 process（tts_service.py，跑在另一個 conda env），
 # 見 docs/tts-prototype-notes.md。這裡連不上就優雅降級成純文字，不影響
@@ -67,7 +96,8 @@ TTS_ENABLED = True
 # 用 127.0.0.1 而非 localhost：WSL 的 port relay 只聽 IPv4，localhost 會先試
 # ::1、等它 timeout 才 fallback，每次新連線平白多 ~2s（tts_client 每次呼叫
 # 都開新的 AsyncClient，所以每句話都付一次，而且已頂到 connect=2.0 的上限）。
-TTS_SERVICE_URL = "http://127.0.0.1:8001"
+TTS_SERVICE_URL = PIPELINE_CFG["tts"].get(
+    "endpoint", "http://127.0.0.1:8001/synthesize").rsplit("/synthesize", 1)[0]
 
 SYSTEM_PROMPT = (
     "你是 imood，一個溫暖、有同理心的陪伴型虛擬人。"
@@ -75,6 +105,38 @@ SYSTEM_PROMPT = (
 )
 
 app = FastAPI(title="imood.ai chat backend")
+
+# 前端頁面由這個服務一起送出，不要用 file:// 直接開。
+# demo-imood-dashboard.html 的「播放範例語音」是 fetch('demo-assets/sample-zh.wav')，
+# 而瀏覽器會擋 file:// 來源的 fetch（file:// 是 opaque origin），
+# 按下去只會得到「範例語音載入失敗」。從 http://localhost:8000/ 開就同源了。
+REPO_DIR = Path(__file__).resolve().parent
+if (REPO_DIR / "demo-assets").is_dir():
+    app.mount("/demo-assets",
+              StaticFiles(directory=str(REPO_DIR / "demo-assets")),
+              name="demo-assets")
+
+
+if JOYGEN_CLIP_DIR:
+    # 先建再掛：JoyGen 是第一句話進來時才建這個目錄的，而這邊通常比它早啟動。
+    # 之前用 isdir() 判斷的版本會在目錄還不存在時靜靜地跳過掛載，之後每支
+    # 影片都 404，而且完全沒有錯誤訊息。
+    try:
+        os.makedirs(JOYGEN_CLIP_DIR, exist_ok=True)
+        app.mount(JOYGEN_CLIP_ROUTE,
+                  StaticFiles(directory=JOYGEN_CLIP_DIR), name="avatar-clips")
+        print(f"[joygen] avatar 影片目錄: {JOYGEN_CLIP_DIR}", flush=True)
+    except OSError as exc:
+        print(f"[joygen] 影片目錄掛不上（{exc}），前端只會看到靜態照片",
+              flush=True)
+
+
+@app.get("/")
+def dashboard():
+    # 開發期不要快取：改完 HTML/JS 之後重新整理就該拿到新的，不然會對著
+    # 舊的程式碼除錯。
+    return FileResponse(str(REPO_DIR / "demo-imood-dashboard.html"),
+                        headers={"Cache-Control": "no-store"})
 
 # 開發階段先全開，正式上線後應該改成白名單網域
 app.add_middleware(
@@ -244,7 +306,10 @@ def chat_stream(req: ChatRequest):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
-async def _stream_reply_to_ws(websocket: WebSocket, loop, user_text: str) -> None:
+async def _stream_reply_to_ws(websocket: WebSocket, loop, user_text: str,
+                              voice: str = "female",
+                              joygen: Optional[JoyGenClient] = None,
+                              session: str = "ws") -> None:
     """
     把同步的 llm_stream() generator 橋接成 async，逐段送 reply_delta，
     最後送 reply_done。生成在 thread pool 跑，透過 queue 把 delta 丟回
@@ -285,22 +350,40 @@ async def _stream_reply_to_ws(websocket: WebSocket, loop, user_text: str) -> Non
     })
 
     if not failed and TTS_ENABLED:
-        await _stream_tts_to_ws(websocket, "".join(full_text_parts))
+        await _stream_tts_to_ws(websocket, "".join(full_text_parts),
+                                voice=voice, joygen=joygen, session=session)
 
 
-async def _stream_tts_to_ws(websocket: WebSocket, text: str) -> None:
+async def _stream_tts_to_ws(websocket: WebSocket, text: str,
+                            voice: str = "female",
+                            joygen: Optional[JoyGenClient] = None,
+                            session: str = "ws") -> None:
     """
     LLM 回覆全部生成完之後才合成語音（先求簡單能動，見
     docs/tts-prototype-notes.md 的取捨說明；之後要更即時可以改成逐句合成）。
     tts_service 連不上或出錯都不當作致命錯誤——文字回覆已經送完了，這裡
     失敗只送一個 error 訊息，不能讓 /ws/audio 的主迴圈掛掉。
+
+    同一份 PCM 分兩路：base64 送瀏覽器播放，raw bytes 推 JoyGen 生成嘴型。
+    兩邊拿到同一份音訊，畫面與聲音才會對得上；JoyGen 那路失敗只是沒有畫面。
+
+    注意 joygen.end() 會等 JoyGen 把整句畫完才回，所以它排在 audio_done
+    之後——不能讓畫面的生成時間卡住瀏覽器的播放。
     """
     text = text.strip()
     if not text:
         return
+
+    utterance = f"u{int(time.time() * 1000)}"
+    pushing = False
+    if joygen is not None:
+        pushing = await joygen.begin(session, utterance, voice=voice,
+                                     emotion=None,  # 之後接 BERT 填這裡
+                                     text=text)
+
     seq = 0
     try:
-        async for chunk in stream_tts(text, TTS_SERVICE_URL):
+        async for chunk in stream_tts(text, TTS_SERVICE_URL, voice=voice):
             seq += 1
             await websocket.send_json({
                 "type": "audio_delta",
@@ -308,10 +391,38 @@ async def _stream_tts_to_ws(websocket: WebSocket, text: str) -> None:
                 "sample_rate": PCM_SAMPLE_RATE,
                 "seq": seq,
             })
+            if pushing:
+                await joygen.audio(chunk)
         await websocket.send_json({"type": "audio_done"})
     except Exception as exc:  # noqa: BLE001 — TTS 失敗不影響已完成的文字回覆
         print(f"[tts] 合成失敗，改為純文字回覆: {exc}", flush=True)
         await websocket.send_json({"type": "error", "error": "語音合成暫時無法使用"})
+    finally:
+        if pushing:
+            # 不要在這裡 await JoyGen —— 它要畫幾十秒，而這段期間 handler
+            # 沒有回到 receive_bytes()，uvicorn 會停止讀取這條 WebSocket
+            # （流量控制），連 ping/pong 都不處理，最後整條連線被 keepalive
+            # 判定斷線。丟到背景，畫好了再把 avatar_video 送出去。
+            async def _on_joygen_done(result):
+                print(f"[joygen] {utterance} voice={voice} "
+                      f"frames={result.get('frames')} "
+                      f"first_frame={result.get('ingest_to_first_frame_ms')}ms "
+                      f"video={result.get('video')}", flush=True)
+                clip = result.get("video")
+                if not clip:
+                    return
+                try:
+                    await websocket.send_json({
+                        "type": "avatar_video",
+                        "url": f"{JOYGEN_CLIP_ROUTE}/{clip}",
+                        "avatar": result.get("avatar"),
+                        "frames": result.get("frames"),
+                        "generate_ms": result.get("utterance_ms"),
+                    })
+                except Exception:  # noqa: BLE001 — 連線可能已經關了
+                    pass
+
+            await joygen.end_in_background(_on_joygen_done)
 
 
 @app.websocket("/ws/audio")
@@ -339,11 +450,26 @@ async def audio_stream(websocket: WebSocket):
     """
     await websocket.accept()
 
-    endpointer = Endpointer()
+    # 男/女聲用 query 參數帶進來（/ws/audio?voice=male）。主迴圈是純 binary
+    # 的 receive_bytes()，插 text frame 進來會讓它拋例外，所以不走訊息協定。
+    # 換聲音 = 前端重連一次，一個連線一種聲音。
+    voice = (websocket.query_params.get("voice") or DEFAULT_VOICE).lower()
+    if voice not in VALID_VOICES:
+        voice = DEFAULT_VOICE
+    session = websocket.query_params.get("session") or f"ws{int(time.time())}"
+
+    # VAD 參數來自共用的 pipeline.yaml（斷句秒數等在那裡調，不要改這裡）
+    endpointer = Endpointer(EndpointConfig(**ENDPOINT_KWARGS))
+    joygen = JoyGenClient(JOYGEN_HOST, JOYGEN_PORT, enabled=JOYGEN_ENABLED,
+                          status_timeout=JOYGEN_STATUS_TIMEOUT)
+
     loop = asyncio.get_running_loop()
     chunk_count = 0
     byte_count = 0
     start = time.time()
+    print(f"[voice] 連線 session={session} voice={voice} "
+          f"end_silence_ms={ENDPOINT_KWARGS.get('end_silence_ms')} "
+          f"joygen={'on' if JOYGEN_ENABLED else 'off'}", flush=True)
 
     pending: list = []  # 已辨識、還在等可能續句、還沒丟 LLM 的 transcript 片段
 
@@ -360,7 +486,8 @@ async def audio_stream(websocket: WebSocket):
             return
         print(f"[voice] -> LLM ({len(text)} 字): {text!r}", flush=True)
         async with _llm_lock:
-            await _stream_reply_to_ws(websocket, loop, text)
+            await _stream_reply_to_ws(websocket, loop, text, voice=voice,
+                                      joygen=joygen, session=session)
 
     try:
         while True:
@@ -443,8 +570,20 @@ async def audio_stream(websocket: WebSocket):
             f"{byte_count} bytes, {elapsed:.1f}s",
             flush=True,
         )
+    finally:
+        # 一個連線一條 JoyGen 通道，斷線就收掉，不要留著佔住服務端的 session
+        await joygen.close()
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": llm is not None}
+    return {
+        "status": "ok",
+        "model_loaded": llm is not None,
+        "voice_default": DEFAULT_VOICE,
+        "vad_end_silence_ms": ENDPOINT_KWARGS.get("end_silence_ms"),
+        "coalesce_ms": VOICE_COALESCE_MS,
+        "joygen": {"enabled": JOYGEN_ENABLED,
+                   "host": JOYGEN_HOST, "port": JOYGEN_PORT,
+                   "status_timeout_s": JOYGEN_STATUS_TIMEOUT},
+    }
