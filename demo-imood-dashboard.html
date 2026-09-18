@@ -190,9 +190,17 @@
     gap:18px;
   }
   .avatar-frame{
-    width:260px;
-    height:260px;
-    border-radius:50%;
+    /* 盡量填滿主欄位，取三者的最小值：
+         900px          來源影片就是 900x900，再大只是放大糊掉
+         100vh - 160px  扣掉 header(56)、main 的上下 padding(48)、
+                        下方「換一張臉」與 badge(約 56)
+         100vw - 720px  扣掉左側欄(280)、右側對話紀錄(380)、padding(48)
+       —— 用 min() 讓視窗不論先碰到高度還是寬度的限制都不會爆版。 */
+    width:min(900px, calc(100vh - 160px), calc(100vw - 720px));
+    min-width:240px;
+    aspect-ratio:1 / 1;
+    /* 方形：來源影片是 900x900，圓形會裁掉約兩成（四個角、部分頭髮與肩膀） */
+    border-radius:16px;
     background:var(--bg-panel);
     border:1px solid var(--line);
     display:flex;
@@ -204,40 +212,101 @@
   .avatar-frame.speaking{
     box-shadow: 0 0 0 6px var(--accent-dim);
   }
-  #face-mouth{ transition: d 0.35s ease; }
-  #face-brow-l, #face-brow-r{ transition: transform 0.35s ease, d 0.35s ease; }
-  #avatar-video{
+  /* 靜態照片與影片疊在同一個位置，同樣的裁切方式 —— 換過去時只有嘴會變，
+     頭的位置與背景不會跳。 */
+  #avatar-still, #avatar-video{
+    position:absolute;
+    inset:0;
     width:100%;
     height:100%;
-    border-radius:50%;
+    border-radius:16px;
     object-fit:cover;
-    display:none;
   }
+  #avatar-video{ display:none; }
   .avatar-frame.video-active #avatar-video{ display:block; }
-  .avatar-frame.video-active #avatar-svg{ display:none; }
+  .avatar-frame.video-active #avatar-still{ display:none; }
 
-  .emotion-meter{
-    display:flex;
-    gap:10px;
-  }
-  .meter-chip{
+  .avatar-badge{
+    position:absolute;
+    bottom:-10px;
+    left:50%;
+    transform:translateX(-50%);
+    white-space:nowrap;
     font-family:var(--mono);
+    font-size:10px;
+    color:var(--text-dim);
+    background:var(--bg-panel-2);
+    border:1px solid var(--line);
+    border-radius:999px;
+    padding:3px 10px;
+    opacity:0;
+    transition:opacity 0.25s ease;
+  }
+  .avatar-badge.on{ opacity:1; }
+
+  /* --- 選臉 --- */
+  .face-picker{
+    display:flex;
+    gap:20px;
+    align-items:flex-end;
+  }
+  .face-card{
+    background:none;
+    border:none;
+    padding:0;
+    cursor:pointer;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:10px;
+    font-family:var(--sans);
+  }
+  .face-card .face-photo{
+    /* 兩張並排，所以上限比對話中那張小；主欄位最窄的情況也塞得下 */
+    width:clamp(150px, 34vh, 320px);
+    aspect-ratio:1 / 1;
+    border-radius:12px;
+    overflow:hidden;
+    border:2px solid var(--line);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:var(--bg-panel);
+    transition:border-color 0.25s ease, transform 0.25s ease;
+  }
+  .face-card .face-photo img{ width:100%; height:100%; object-fit:cover; }
+  .face-photo-empty{
     font-size:11px;
     color:var(--text-dim);
-    border:1px solid var(--line);
-    padding:5px 12px;
-    border-radius:999px;
-    transition:all 0.25s ease;
+    text-align:center;
+    line-height:1.5;
+    padding:0 14px;
   }
-  .meter-chip.active{
-    color:var(--bg-deep);
-    border-color:transparent;
-    font-weight:600;
+  .face-card:hover:not(:disabled) .face-photo{ border-color:var(--accent); }
+  .face-card.selected .face-photo{
+    border-color:var(--accent);
+    transform:scale(1.08);
   }
-  .meter-chip[data-emotion="joy"].active{background:var(--joy);}
-  .meter-chip[data-emotion="anger"].active{background:var(--anger);}
-  .meter-chip[data-emotion="sorrow"].active{background:var(--sorrow);}
-  .meter-chip[data-emotion="calm"].active{background:var(--calm);}
+  .face-card .face-name{ font-size:13px; color:var(--text-mid); }
+  .face-card.selected .face-name{ color:var(--text-hi); font-weight:600; }
+  .face-card:disabled{ cursor:not-allowed; opacity:0.55; }
+
+  .face-switch{
+    background:none;
+    border:none;
+    color:var(--text-dim);
+    font-family:var(--sans);
+    font-size:11px;
+    cursor:pointer;
+    text-decoration:underline;
+    display:none;
+  }
+  .face-switch:hover{ color:var(--text-mid); }
+
+  /* 選定之後：收起選單、只留選中的那張大頭像 */
+  .avatar-stage.picked .face-picker{ display:none; }
+  .avatar-stage.picked .face-switch{ display:block; }
+  .avatar-stage:not(.picked) .avatar-frame{ display:none; }
 
   .transcript{
     grid-area:transcript;
@@ -362,28 +431,33 @@
   </aside>
 
   <main>
-    <div class="avatar-stage">
+    <!--
+      選臉 → 對話。選哪張臉就決定用哪個聲音，所以左側沒有另外的男女聲選項。
+
+      對話過程中畫面上一直是那張「靜態照片」；JoyGen 把整句的嘴型算完之後，
+      才把影片接在同一個位置播出來。照片用的就是影片的第一幀（見
+      pipeline.yaml 的 still_frame），所以切換時頭部姿勢與背景是對齊的。
+
+      情緒表情之後由 BERT 判斷驅動，原本那張 SVG 假臉已經拿掉。
+    -->
+    <div class="avatar-stage" id="avatar-stage">
+      <div class="face-picker" id="face-picker">
+        <button type="button" class="face-card selected" data-avatar="female">
+          <span class="face-photo"><img src="demo-assets/face_female.jpg" alt="女生虛擬人"></span>
+          <span class="face-name">女生</span>
+        </button>
+        <button type="button" class="face-card pending" data-avatar="male" disabled>
+          <span class="face-photo face-photo-empty">人選確認中</span>
+          <span class="face-name">男生</span>
+        </button>
+      </div>
+
       <div class="avatar-frame" id="avatar-frame">
-        <!--
-          JoyGen 接上後：pc.ontrack = (e) => { avatarVideo.srcObject = e.streams[0]; showVideo(); }
-          在拿到真的 remote stream 之前，video 保持 hidden，畫面用下面的 SVG 假臉代替。
-        -->
-        <video id="avatar-video" autoplay playsinline muted></video>
-        <svg id="avatar-svg" width="160" height="160" viewBox="0 0 160 160">
-          <circle cx="80" cy="80" r="70" fill="none" stroke="#22314D" stroke-width="1"/>
-          <path id="face-brow-l" d="M52 60 Q62 54 72 60" stroke="#9AA9C2" stroke-width="3" fill="none" stroke-linecap="round"/>
-          <path id="face-brow-r" d="M88 60 Q98 54 108 60" stroke="#9AA9C2" stroke-width="3" fill="none" stroke-linecap="round"/>
-          <circle cx="62" cy="76" r="5" fill="#EDF1F7"/>
-          <circle cx="98" cy="76" r="5" fill="#EDF1F7"/>
-          <path id="face-mouth" d="M58 106 Q80 118 102 106" stroke="#EDF1F7" stroke-width="4" fill="none" stroke-linecap="round"/>
-        </svg>
+        <img id="avatar-still" src="demo-assets/face_female.jpg" alt="虛擬人">
+        <video id="avatar-video" playsinline></video>
+        <div class="avatar-badge" id="avatar-badge"></div>
       </div>
-      <div class="emotion-meter" id="emotion-meter">
-        <div class="meter-chip active" data-emotion="calm">樂 / 平靜</div>
-        <div class="meter-chip" data-emotion="joy">喜</div>
-        <div class="meter-chip" data-emotion="anger">怒</div>
-        <div class="meter-chip" data-emotion="sorrow">哀</div>
-      </div>
+      <button type="button" class="face-switch" id="face-switch">換一張臉</button>
     </div>
   </main>
 
@@ -405,23 +479,21 @@
 //
 // 1. callDialogueModel(text)  → 已接上後端 /api/chat（見 server.py，
 //    用 llama.cpp 跑 Qwen2.5-1.5B-Instruct）
-// 2. detectEmotion(text)      → 目前仍是關鍵字假規則，
-//    TODO：換成真正呼叫 BERT 情緒分類器的結果
-//
-// 之後如果要接 WebRTC + JoyGen，則是在 avatar-frame 這個位置，
-// 用 <video> 取代目前的 SVG 臉，並在 pc.ontrack 拿到 stream 後
-// videoEl.srcObject = event.streams[0]
+// 2. 表情：原本的 SVG 假臉與關鍵字判別已移除，之後由 BERT 的情緒結果驅動
+// 3. avatar 畫面：JoyGen 每句輸出一支 mp4，算完後由 avatar_video 訊息帶
+//    URL 過來，接在靜態照片的位置播（不走 WebRTC，見 M3 紀錄）
 // ============================================================
 
 const transcriptBody = document.getElementById('transcript-body');
 const textInput = document.getElementById('text-input');
 const sendBtn = document.getElementById('send-btn');
+const avatarStage = document.getElementById('avatar-stage');
 const avatarFrame = document.getElementById('avatar-frame');
 const avatarVideo = document.getElementById('avatar-video');
-const mouth = document.getElementById('face-mouth');
-const browL = document.getElementById('face-brow-l');
-const browR = document.getElementById('face-brow-r');
-const meterChips = document.querySelectorAll('.meter-chip');
+const avatarStill = document.getElementById('avatar-still');
+const avatarBadge = document.getElementById('avatar-badge');
+const facePicker = document.getElementById('face-picker');
+const faceSwitch = document.getElementById('face-switch');
 const micBtn = document.getElementById('mic-btn');
 const micTag = document.getElementById('mic-tag');
 const micMeterBar = document.getElementById('mic-meter-bar');
@@ -443,51 +515,106 @@ function resetStatus() {
 }
 
 // ============================================================
-// JoyGen WebRTC 對接點（目前是空殼，等品靜那邊確認 track 可用後再實作）
+// 選臉 + avatar 畫面
 //
-// 用法：等 RTCPeerConnection 建立好、pc.ontrack 觸發時呼叫
-//   attachRemoteStream(event.streams[0])
-// 就會自動把 <video> 打開、蓋掉 SVG 假臉。
+// 選哪張臉就決定用哪個聲音（一個連線一種），所以左側沒有另外的聲音選項。
+// 換臉要重新連一次 /ws/audio，因為 voice 是接在 query 上的。
+//
+// 流程中畫面一直是靜態照片；JoyGen 把整句算完之後，server.py 會送一個
+// avatar_video 訊息過來，那時才把影片接到同一個位置播。
 // ============================================================
-function attachRemoteStream(stream) {
-  avatarVideo.srcObject = stream;
-  avatarFrame.classList.add('video-active');
-}
+let selectedAvatar = 'female';
+let selectedVoice = 'female';
 
-function detachRemoteStream() {
-  avatarVideo.srcObject = null;
-  avatarFrame.classList.remove('video-active');
-}
-
-// --- 表情設定：之後要接 JoyGen 的表情素材，可以把這幾組路徑
-//     換成「選對應情緒影片」的邏輯，而不是畫 SVG ---
-const FACES = {
-  calm:   { mouth: 'M58 106 Q80 118 102 106', browL: 'M52 60 Q62 54 72 60', browR: 'M88 60 Q98 54 108 60' },
-  joy:    { mouth: 'M56 102 Q80 128 104 102', browL: 'M52 58 Q62 50 74 58', browR: 'M86 58 Q98 50 108 58' },
-  anger:  { mouth: 'M58 110 Q80 100 102 110', browL: 'M52 64 Q64 60 76 66', browR: 'M84 66 Q96 60 108 64' },
-  sorrow: { mouth: 'M58 112 Q80 104 102 112', browL: 'M52 66 Q64 56 76 62', browR: 'M84 62 Q96 56 108 66' },
+const FACE_STILLS = {
+  female: 'demo-assets/face_female.jpg',
+  // male: 待人選定後補上
 };
 
-function setEmotion(emotion) {
-  const f = FACES[emotion] || FACES.calm;
-  mouth.setAttribute('d', f.mouth);
-  browL.setAttribute('d', f.browL);
-  browR.setAttribute('d', f.browR);
-  meterChips.forEach(chip => {
-    chip.classList.toggle('active', chip.dataset.emotion === emotion);
+function pickFace(avatarId) {
+  selectedAvatar = avatarId;
+  selectedVoice = avatarId;          // 選臉就是選聲音
+  avatarStill.src = FACE_STILLS[avatarId] || FACE_STILLS.female;
+  facePicker.querySelectorAll('.face-card').forEach((card) => {
+    card.classList.toggle('selected', card.dataset.avatar === avatarId);
   });
+  avatarStage.classList.add('picked');
+  showStill();
+  if (micBtn.classList.contains('recording')) {
+    setStatus('已換臉，停止再重新啟用語音輸入才會生效', null);
+  }
 }
 
-// --- 極簡關鍵字判別，純粹是 demo 用的假規則 ---
-// TODO: 換成呼叫君榮那邊的 BERT 情緒分類器（4 類：喜/怒/哀/樂）
-function detectEmotion(text) {
-  const joyWords = ['開心', '太好了', '哈哈', '謝謝', '讚', '喜歡'];
-  const angerWords = ['生氣', '討厭', '爛', '氣死', '煩'];
-  const sorrowWords = ['難過', '傷心', '哭', '失望', '孤單'];
-  if (joyWords.some(w => text.includes(w))) return 'joy';
-  if (angerWords.some(w => text.includes(w))) return 'anger';
-  if (sorrowWords.some(w => text.includes(w))) return 'sorrow';
-  return 'calm';
+facePicker.addEventListener('click', (e) => {
+  const card = e.target.closest('.face-card');
+  if (!card || card.disabled) return;
+  pickFace(card.dataset.avatar);
+});
+
+faceSwitch.addEventListener('click', () => {
+  avatarStage.classList.remove('picked');
+  showStill();
+});
+
+// 回到靜態照片（每一句的開頭、影片播完之後）
+function showStill() {
+  avatarFrame.classList.remove('video-active');
+  avatarVideo.pause();
+  avatarVideo.removeAttribute('src');
+  avatarVideo.load();
+  avatarBadge.classList.remove('on');
+}
+
+function setAvatarBadge(text) {
+  if (!text) { avatarBadge.classList.remove('on'); return; }
+  avatarBadge.textContent = text;
+  avatarBadge.classList.add('on');
+}
+
+// 影片與語音都要在「使用者按下按鈕」的那一刻先解鎖，否則幾十秒後才拿到的
+// 影片會被瀏覽器的自動播放政策擋掉（Chrome 只認使用者互動過的頁面，而且
+// <video> 元素要自己被播過一次才算數）。
+// 送出語音的入口（範例語音、啟用麥克風）都會先呼叫這個。
+function primeMedia() {
+  // AudioContext 一定要在使用者手勢裡建立/恢復，否則之後 Web Audio 出不了聲。
+  // 這條路徑是「影片被擋掉時」的備援，所以它必須是可靠的那一個。
+  if (!ttsAudioCtx) {
+    ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    ttsNextPlayTime = ttsAudioCtx.currentTime;
+  }
+  if (ttsAudioCtx.state === 'suspended') ttsAudioCtx.resume().catch(() => {});
+
+  // 注意：這裡**不**去預播 <video>。那時候它還沒有 src，play() 必定失敗，
+  // 等於什麼都沒解鎖。影片能不能帶聲音自動播，取決於瀏覽器認不認這個網域
+  // 的使用者互動——認就直接播，不認就走上面那條 Web Audio 備援。
+}
+
+// JoyGen 算完了：把影片接到照片的位置播出來，聲音跟著影片走。
+//
+// 萬一瀏覽器仍然擋下帶聲音的播放，不要留一個「點我播放」的死路——改成
+// 靜音播影片 + 用 Web Audio 播**同一份** PCM（那條路徑在 primeMedia 就解鎖
+// 了）。兩者同時開始，所以嘴型跟聲音還是對得上。
+function playAvatarVideo(url) {
+  cancelAudioFallbackTimer();
+  const chunks = pendingAudioChunks;
+  pendingAudioChunks = [];
+
+  avatarVideo.src = url;
+  avatarVideo.muted = false;
+  avatarFrame.classList.add('video-active');
+  setAvatarBadge('avatar 回覆中');
+
+  const started = avatarVideo.play();
+  if (started && started.catch) {
+    started.catch((err) => {
+      console.warn('[avatar] 帶聲音播放被擋，改成靜音影片 + Web Audio 語音', err);
+      avatarVideo.muted = true;
+      avatarVideo.play().catch(() => {});
+      playChunks(chunks);
+    });
+  }
+
+  avatarVideo.onended = () => { showStill(); resetStatus(); };
 }
 
 // --- 真正的對話模型：呼叫後端 /api/chat/stream（SSE） ---
@@ -562,7 +689,6 @@ async function handleSend() {
   sendBtn.disabled = true;
 
   appendMessage('user', text);
-  setEmotion(detectEmotion(text));
 
   avatarFrame.classList.add('speaking');
   setStatus('回覆中…', 'busy');
@@ -604,9 +730,16 @@ textInput.addEventListener('keydown', e => {
 //
 // 後端（server.py /ws/audio）：累積 chunk → VAD 斷句 → faster-whisper
 // 辨識 → 丟給 Qwen 產生回覆，逐段串流回來。訊息協定見 handleVoiceMessage()。
-// 講完一句話 → 看到回覆，跟打字模式共用同一套 appendMessage / setEmotion。
+// 講完一句話 → 看到回覆，跟打字模式共用同一套 appendMessage。
 // ============================================================
 const AUDIO_WS_URL = 'ws://localhost:8000/ws/audio';
+
+// 聲音與臉都用 query 參數帶：/ws/audio 是純 binary 的收流迴圈，插 text
+// frame 進去會讓它拋例外。一個連線一種臉，換臉要重連（見 pickFace）。
+function audioWsUrl() {
+  return `${AUDIO_WS_URL}?voice=${encodeURIComponent(selectedVoice)}`
+       + `&avatar=${encodeURIComponent(selectedAvatar)}`;
+}
 const PCM_TARGET_SAMPLE_RATE = 16000;
 const PCM_CHUNK_MS = 320; // 對齊 JoyGen 8-frame batch @25fps
 
@@ -672,6 +805,45 @@ let ttsNextPlayTime = 0;
 // 播放連貫（見 docs/tts-prototype-notes.md）。
 let pendingAudioChunks = [];
 
+// 聲音預設跟著 JoyGen 的影片一起播（音畫同步）。但 JoyGen 可能沒開、掛掉，
+// 或一句話算太久 —— 那種情況下使用者不該完全聽不到回覆，所以逾時就退回
+// 單獨播語音。時間抓得寬，因為生成本來就慢（實測一句 11 秒的話要 41 秒）。
+const AUDIO_FALLBACK_MS = 120000;
+let audioFallbackTimer = null;
+
+// 一次把整段排進去播。每次都從「現在」重新起算排程游標，不然上一句留下的
+// ttsNextPlayTime 會讓這一句被排到很久以後才響。
+function playChunks(chunks) {
+  if (!chunks || !chunks.length) return;
+  if (ttsAudioCtx) {
+    if (ttsAudioCtx.state === 'suspended') ttsAudioCtx.resume().catch(() => {});
+    ttsNextPlayTime = ttsAudioCtx.currentTime;
+  }
+  for (const chunk of chunks) {
+    playAudioChunk(chunk.audio, chunk.sample_rate);
+  }
+}
+
+function startAudioFallback() {
+  cancelAudioFallbackTimer();
+  audioFallbackTimer = setTimeout(() => {
+    audioFallbackTimer = null;
+    if (!pendingAudioChunks.length) return;
+    console.warn('[avatar] 等不到 JoyGen 影片，改為只播語音');
+    setAvatarBadge('畫面逾時，僅播放語音');
+    playChunks(pendingAudioChunks);
+    pendingAudioChunks = [];
+    resetStatus();
+  }, AUDIO_FALLBACK_MS);
+}
+
+function cancelAudioFallbackTimer() {
+  if (audioFallbackTimer) {
+    clearTimeout(audioFallbackTimer);
+    audioFallbackTimer = null;
+  }
+}
+
 function playAudioChunk(base64, sampleRate) {
   if (!ttsAudioCtx) {
     ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -699,7 +871,7 @@ function playAudioChunk(base64, sampleRate) {
 }
 
 function connectAudioSocket() {
-  const socket = new WebSocket(AUDIO_WS_URL);
+  const socket = new WebSocket(audioWsUrl());
   socket.binaryType = 'arraybuffer';
   socket.onopen = () => console.log('[voice] /ws/audio 連線成功');
   socket.onerror = (err) => console.error('[voice] /ws/audio 連線錯誤：', err);
@@ -736,7 +908,6 @@ function handleVoiceMessage(msg) {
 
     case 'transcript':
       appendMessage('user', msg.text);
-      setEmotion(detectEmotion(msg.text));
       // avatar 回覆的泡泡等 reply_delta 才建：後端辨識完可能還在等使用者把
       // 話講完（coalesce window），這段時間可能再來一個 transcript。
       voiceReplyFull = '';
@@ -772,12 +943,22 @@ function handleVoiceMessage(msg) {
       break;
 
     case 'audio_done':
-      // 整段語音都到齊了，現在一次排程播放，chunk 之間不會有等待、
-      // 播放才會連貫。
-      for (const chunk of pendingAudioChunks) {
-        playAudioChunk(chunk.audio, chunk.sample_rate);
-      }
-      pendingAudioChunks = [];
+      // 語音全到了，但**先不播** —— 影片本身含聲音，等 JoyGen 算完一起播才
+      // 會音畫同步（不然使用者會先聽到回覆、幾十秒後再看到嘴型動）。
+      //
+      // 保險：JoyGen 沒開、掛掉或算太久時不能讓使用者什麼都聽不到，
+      // 所以設一個計時器，逾時就退回單獨播語音。
+      setStatus('生成 avatar 畫面中…', 'busy');
+      setAvatarBadge('生成畫面中…');
+      startAudioFallback();
+      break;
+
+    case 'avatar_video':
+      // JoyGen 算完了：影片接到照片的位置，聲音跟著影片走。
+      console.log('[avatar]', msg.url, msg.frames, '張,',
+                  Math.round((msg.generate_ms || 0) / 1000), '秒');
+      playAvatarVideo(msg.url);
+      setStatus('avatar 回覆中', 'busy');
       break;
 
     case 'error':
@@ -791,6 +972,7 @@ function handleVoiceMessage(msg) {
 }
 
 async function enableMic() {
+  primeMedia();   // 同上：趁使用者點擊時解鎖
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   } catch (err) {
@@ -936,6 +1118,8 @@ function endSamplePlayback() {
 
 async function playSample() {
   if (samplePlaying || micStream) return;
+  // 這裡還在使用者點擊的當下，是唯一能解鎖音訊與影片播放的時機
+  primeMedia();
   samplePlaying = true;
   sampleBtn.disabled = true;
   sampleBtn.classList.add('playing');
@@ -959,7 +1143,7 @@ async function playSample() {
   const stream = new Uint8Array(bytesFor(600) + pcm.length + bytesFor(1600));
   stream.set(pcm, bytesFor(600));
 
-  const ws = new WebSocket(AUDIO_WS_URL);
+  const ws = new WebSocket(audioWsUrl());
   ws.binaryType = 'arraybuffer';
   let replyDoneAt = null;
   // reply_done 之後 server 還會接著送 TTS 的 audio_delta/audio_done（見
@@ -967,7 +1151,11 @@ async function playSample() {
   // 語音還沒送到就被切斷了。改成等 audio_done/error，並加一個保險 timeout
   // ——如果後端 TTS_ENABLED=False 或卡住，reply_done 之後不會再有任何
   // 訊息，避免連線和 UI 卡住不會結束。
-  const FALLBACK_CLOSE_MS = 20000;
+  // audio_done 之後還會有 avatar_video（server.py 要等 JoyGen 把整句畫完才
+  // 送），所以不能在 audio_done 就關連線，不然影片永遠收不到。改成等
+  // avatar_video；JoyGen 沒開或算太久時，由下面的計時器收尾。
+  const FALLBACK_CLOSE_MS = 150000;
+  let audioDoneAt = null;
   ws.onmessage = (evt) => {
     let msg;
     try { msg = JSON.parse(evt.data); } catch (e) { return; }
@@ -975,14 +1163,18 @@ async function playSample() {
     if (msg.type === 'reply_done') {
       replyDoneAt = Date.now();
     }
-    if (msg.type === 'audio_done' || msg.type === 'error') {
+    if (msg.type === 'audio_done') {
+      audioDoneAt = Date.now();
+    }
+    if (msg.type === 'avatar_video' || msg.type === 'error') {
       clearInterval(fallbackTimer);
       ws.close();
       endSamplePlayback();
     }
   };
   const fallbackTimer = setInterval(() => {
-    if (replyDoneAt && Date.now() - replyDoneAt >= FALLBACK_CLOSE_MS) {
+    const since = audioDoneAt || replyDoneAt;
+    if (since && Date.now() - since >= FALLBACK_CLOSE_MS) {
       clearInterval(fallbackTimer);
       ws.close();
       endSamplePlayback();
