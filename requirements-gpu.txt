@@ -2,17 +2,58 @@
 #
 #   venv\Scripts\python -m pip install -r requirements-gpu.txt
 #
-# faster-whisper 的後端 CTranslate2 4.8 已能自動找到這些 pip 包，
-# 但 Windows 上還需要把它們的 bin 目錄加進 DLL 搜尋路徑——voice_asr.py
-# 的 _register_nvidia_dll_dirs() 已處理，不用手動設 PATH。
+# 這裡的四個 NVIDIA 套件同時供兩邊使用：
+#   ASR  faster-whisper 的後端 CTranslate2（cudnn / cublas）
+#   LLM  llama-cpp-python 的 CUDA build（cudart / cublas）
 #
-# 裝好後 server.py 啟動時 Transcriber 會自動偵測到 CUDA（device="auto"），
-# small 模型 6s 音檔辨識從 ~1.8s 降到 ~0.3s。要強制關掉：設 ASR_DEVICE=cpu。
+# Windows：CTranslate2 4.8 找得到這些 pip 包，但還要把它們的 bin 目錄加進
+# DLL 搜尋路徑——voice_asr.py 的 _register_nvidia_dll_dirs() 已處理，不用
+# 手動設 PATH。裝好後 server.py 啟動時 Transcriber 會自動偵測到 CUDA
+# （device="auto"），small 模型 6s 音檔辨識 ~1.8s -> 0.232s（4090 實測）。
+# 要強制關掉：設 ASR_DEVICE=cpu。
 #
-# 註：llama-cpp-python 的 GPU 版 Windows 沒有現成 wheel（abetlen 只出到
-# 0.2.68），要 GPU 得自己 source build，見 README。TTS(CosyVoice) 的
-# torch 部分只要環境有 CUDA 就會自動上 GPU，不需要這裡的東西。
+# --- llama-cpp-python 的 GPU 版（2026-09-18 更正）-----------------------
+#
+# 這裡原本寫著「Windows 沒有現成 GPU wheel（abetlen 只出到 0.2.68），要 GPU
+# 得自己 source build」。那是過時的，已經不成立。現在 venv 裡裝的是 0.3.35，
+# llama_cpp/lib/ 底下有 858MB 的 ggml-cuda.dll，本來就是 CUDA build
+# （4090 實測：載入後 VRAM +1676 MiB、345 tok/s）。
+#
+# 這段錯誤的註解曾經害人推論出「搬到 Linux 才能讓 LLM 上 GPU」這種相反的
+# 結論，所以請不要只讀註解就下判斷——去看 pip list 跟 lib/ 裡實際有什麼。
+#
+# wheel 從 abetlen 的 cu125 index 裝，不要用 cu124：cu124 會在
+# llama_init_from_model() 崩 0xc000001d。它不在下面的清單裡，因為要帶
+# --extra-index-url，而且必須排在 requirements.txt 之前跑（PyPI 上只有
+# sdist，Windows 解壓會撞 260 字元路徑上限）：
+#
+#   venv\Scripts\python -m pip install --force-reinstall --no-cache-dir --no-deps ^
+#     llama-cpp-python==0.3.35 ^
+#     --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu125
+#
+# --- Linux（A100）注意事項 ---------------------------------------------
+#
+# _register_nvidia_dll_dirs() 開頭是 sys.platform != "win32" 就 return，
+# 也就是在 Linux 上什麼都不做。Linux 需要的是 LD_LIBRARY_PATH：
+#
+#   SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+#   export LD_LIBRARY_PATH="$(find $SITE/nvidia -name lib -type d | tr '\n' ':')$LD_LIBRARY_PATH"
+#
+# 沒設的話 pip 裝了也找不到，而且兩邊的失敗方式不同：
+#   llama_cpp       import 就炸（libcudart.so.12 not found），一眼看得出來
+#   faster-whisper  模型載入成功、服務正常起來、第一次 transcribe 才炸
+#                   （Library libcublas.so.12 is not found）
+# 後者代表 /health 回 200 不能當驗收標準，要實際跑一次辨識。
+# 詳見 joygen-deployment-notes/docs/local_records/Linux venv 試裝與 GPU 實測。
+#
+# TTS（CosyVoice）的 torch 部分只要環境有 CUDA 就會自動上 GPU，不需要這裡的
+# 東西——它在另一個 conda 環境、另一套 torch。
 
 nvidia-cudnn-cu12==9.*
 nvidia-cublas-cu12
 nvidia-cuda-nvrtc-cu12
+
+# llama-cpp-python 的 CUDA build 需要 cudart64_12.dll。原本漏在這個清單外、
+# 只在 runbook 裡手動裝，所以照這個檔案重建環境會少它，llama.dll 載不起來。
+# 釘 12.9.* 與其他三個實際裝到的版本對齊（cublas 12.9.2.10 / nvrtc 12.9.86）。
+nvidia-cuda-runtime-cu12==12.9.*
